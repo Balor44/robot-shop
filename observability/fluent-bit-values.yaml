@@ -1,0 +1,11 @@
+config:
+  outputs: |
+    [OUTPUT]
+        Name             loki
+        Match            kube.*
+        Host             loki.loki.svc.cluster.local
+        Port             3100
+        Labels           job=fluent-bit, namespace=$kubernetes['namespace_name'], service=$kubernetes['container_name']
+        Remove_Keys      kubernetes,stream,time,_p
+        Drop_Single_Key  raw
+        Line_Format      json
