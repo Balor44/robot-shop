@@ -26,10 +26,6 @@ spec:
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         # agent networking access
         env:
-          - name: INSTANA_AGENT_HOST
-            valueFrom:
-              fieldRef:
-                fieldPath: status.hostIP
           {{- if .Values.payment.gateway }}
           - name: PAYMENT_GATEWAY
             value: {{ .Values.payment.gateway }}
