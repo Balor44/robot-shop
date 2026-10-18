@@ -1,128 +1,191 @@
-# Sample Microservice Application
+# Capstone 2: Keep It Running (Robot Shop Observability)
 
-Stan's Robot Shop is a sample microservice application you can use as a sandbox to test and learn containerised application orchestration and monitoring techniques. It is not intended to be a comprehensive reference example of how to write a microservices application, although you will better understand some of those concepts by playing with Stan's Robot Shop. To be clear, the error handling is patchy and there is not any security built into the application.
+Author: Nwafor Obinna
+Repo: https://github.com/Balor44/robot-shop
 
-You can get more detailed information from my [blog post](https://www.instana.com/blog/stans-robot-shop-sample-microservice-application/) about this sample microservice application.
+This project takes the Robot Shop microservices demo (a fork of instana/robot-shop) and makes it observable: metrics, logs, traces, an SLO with an error budget alert, and a blameless incident postmortem.
 
-This sample microservice application has been built using these technologies:
-- NodeJS ([Express](http://expressjs.com/))
-- Java ([Spring Boot](https://spring.io/))
-- Python ([Flask](http://flask.pocoo.org))
-- Golang
-- PHP (Apache)
-- MongoDB
-- Redis
-- MySQL ([Maxmind](http://www.maxmind.com) data)
-- RabbitMQ
-- Nginx
-- AngularJS (1.x)
+## Environment
 
-The various services in the sample application already include all required Instana components installed and configured. The Instana components provide automatic instrumentation for complete end to end [tracing](https://docs.instana.io/core_concepts/tracing/), as well as complete visibility into time series metrics for all the technologies.
+* Local Kubernetes cluster using `kind` (cluster name: `capstone`)
+* Robot Shop deployed with its Helm chart into the `robot-shop` namespace
+* Instana agent settings removed from the chart, since we use an open source stack instead
+* Observability stack: Prometheus, Grafana and Alertmanager (kube-prometheus-stack), Blackbox Exporter, Loki, Fluent Bit, Jaeger and the OpenTelemetry Collector
 
-To see the application performance results in the Instana dashboard, you will first need an Instana account. Don't worry a [trial account](https://instana.com/trial?utm_source=github&utm_medium=robot_shop) is free.
+![All Robot Shop pods running](docs/screenshots/01-kubectl-pods.PNG)
 
-## Build from Source
-To optionally build from source (you will need a newish version of Docker to do this) use Docker Compose. Optionally edit the `.env` file to specify an alternative image registry and version tag; see the official [documentation](https://docs.docker.com/compose/env-file/) for more information.
+*All Robot Shop pods in the Running state.*
 
-To download the tracing module for Nginx, it needs a valid Instana agent key. Set this in the environment before starting the build.
+## Architecture
 
-```shell
-$ export INSTANA_AGENT_KEY="<your agent key>"
+```mermaid
+flowchart LR
+    U[User] --> W[web]
+    W --> C[cart]
+    W --> CA[catalogue]
+    W --> S[shipping]
+    C --> R[(redis)]
+    S --> M[(mysql)]
+    BB[Blackbox Exporter] -->|probes home page| W
+    P[Prometheus] --> BB
+    P --> G[Grafana]
+    FB[Fluent Bit] --> L[Loki]
+    L --> G
+    S -->|OTLP traces| OC[OTel Collector]
+    OC --> J[Jaeger]
+    P --> AM[Alertmanager]
+    AM --> D[Discord]
 ```
 
-Now build all the images.
+## Repository layout
 
-```shell
-$ docker-compose build
+```
+observability/
+  probe-web.yaml              Blackbox probe of the web home page
+  dashboards/robot-shop.json  Grafana dashboard as code
+  loki-values.yaml            Loki Helm values
+  fluent-bit-values.yaml      Fluent Bit Helm values
+  loki-datasource.yaml        Loki datasource for Grafana
+  tracing.yaml                Jaeger and OpenTelemetry Collector
+  slo-rules.yaml              SLO recording rules and burn rate alert
+  alertmanager-discord.yaml   Alertmanager route to Discord
+K8s/helm/templates/
+  shipping-deployment.yaml    Shipping service with the OpenTelemetry Java agent
+docs/
+  postmortem-redis-outage.md  Incident postmortem
+  screenshots/                Evidence for each step
 ```
 
-If you modified the `.env` file and changed the image registry, you need to push the images to that registry
+## 1. Metrics and dashboard
 
-```shell
-$ docker-compose push
+Prometheus and Grafana come from the `kube-prometheus-stack` Helm chart. Robot Shop does not expose general request metrics, so the SLI is built from a Blackbox Exporter probe that checks the web home page. The dashboard has three panels:
+
+* Availability: `avg_over_time(probe_success[5m])`
+* Errors: `1 - avg_over_time(probe_success[5m])`
+* Latency: `probe_duration_seconds`
+
+The dashboard JSON is stored in Git and loaded into Grafana through a ConfigMap labelled `grafana_dashboard=1`, so it can be rebuilt from code.
+
+![Grafana Robot Shop dashboard](docs/screenshots/02-graffana-dashboard.PNG)
+
+*The Robot Shop dashboard with availability, errors and latency.*
+
+## 2. Logs
+
+Fluent Bit collects container logs from every pod and ships them to Loki. Grafana reads Loki as a datasource, so logs are searchable next to the metrics.
+
+Example queries:
+
+```
+{namespace="robot-shop"}
+{namespace="robot-shop", service="cart"}
+{namespace="robot-shop"} |~ "(?i)error"
 ```
 
-## Run Locally
-You can run it locally for testing.
+![Loki logs in Grafana Explore](docs/screenshots/03-grafana-loki-1.PNG)
 
-If you did not build from source, don't worry all the images are on Docker Hub. Just pull down those images first using:
+*Logs from the robot-shop namespace.*
 
-```shell
-$ docker-compose pull
+![Loki error search](docs/screenshots/04-grafana-loki-error.PNG)
+
+*Searching for error lines across services.*
+
+## 3. Traces
+
+The `shipping` service is a Java app, so it is instrumented with the OpenTelemetry Java agent without rebuilding the image. An init container downloads the agent jar into a shared volume, and `JAVA_TOOL_OPTIONS` loads it at startup. Traces go to an OpenTelemetry Collector, which forwards them to Jaeger.
+
+Only `shipping` is instrumented. The other services use Node.js, Python, Go and PHP and would each need their own instrumentation.
+
+![Requests passing through shipping and cart](docs/screenshots/05-shipping-cart.PNG)
+
+*Traffic used to generate traces.*
+
+![A trace in Jaeger](docs/screenshots/06-jaeger.PNG)
+
+*A trace for the shipping service in Jaeger.*
+
+## 4. SLO and error budget
+
+| Item | Value |
+| --- | --- |
+| SLI | Share of successful probes of the web home page (`probe_success`) |
+| SLO | 99% availability over 30 days |
+| Error budget | 1% of probes may fail, about 7.2 hours per 30 days |
+| Alert | `RobotShopErrorBudgetBurn` fires when the 5 minute error rate is above 14.4 times the budget (14.4%) for 2 minutes |
+
+The 14.4 multiplier is the standard fast burn threshold: at that rate a 30 day budget would be gone in about 2 days.
+
+![Alert rule loaded, inactive](docs/screenshots/07-robotshoperrorbudgetburn.PNG)
+
+*The alert rule loaded in Prometheus.*
+
+### Alert test
+
+To prove the alert works, the `web` deployment was scaled to zero. The alert went from pending to firing and Alertmanager sent a message to Discord. After scaling `web` back to one replica, a resolved message arrived.
+
+![Alert firing in Prometheus](docs/screenshots/08-prometheus-alerts-firing.PNG)
+
+*The alert in the firing state.*
+
+![Discord alert message](docs/screenshots/09-prometheus-discord-alert.PNG)
+
+*The alert delivered to Discord.*
+
+![Discord resolved message](docs/screenshots/10-prometheus-discordalerts-resolved.PNG)
+
+*The resolved notification after recovery.*
+
+The Discord webhook URL is stored in a Kubernetes Secret created by hand. It is not committed to Git.
+
+## 5. Incident drill: Redis outage
+
+The Redis StatefulSet was scaled to zero to simulate a failure. The full write up is in [docs/postmortem-redis-outage.md](docs/postmortem-redis-outage.md).
+
+Short version:
+
+* Before: adding an item to the cart returned success.
+
+![Cart working before the incident](docs/screenshots/11-sku-Watson.PNG)
+
+* During: adding an item failed because the cart service could not reach Redis.
+
+![Cart failing during the incident](docs/screenshots/12-sku-Watson-failed-redis.PNG)
+
+* Detection: the errors were found in Loki using the cart error query.
+
+![Cart errors in Loki during the incident](docs/screenshots/13-grafana-loki-error.PNG)
+
+* Monitoring gap: the dashboard stayed healthy during the incident, because the probe only checks the home page.
+
+![Dashboard still healthy during the incident](docs/screenshots/14-robot-shop-dashboard.PNG)
+
+* Mitigation: scaling Redis back to one replica restored the cart.
+
+Key lesson: an SLI built only on the home page can say everything is fine while a core feature is down. The first action item is a probe that checks a cart endpoint.
+
+## How to rebuild this from scratch
+
+```
+kind create cluster --name capstone
+helm install robot-shop K8s/helm -n robot-shop --create-namespace
+helm install monitoring prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
+helm install blackbox prometheus-community/prometheus-blackbox-exporter -n monitoring
+kubectl apply -f observability/probe-web.yaml
+kubectl create configmap robot-shop-dashboard -n monitoring --from-file=observability/dashboards/robot-shop.json
+kubectl label configmap robot-shop-dashboard -n monitoring grafana_dashboard=1
+helm install loki grafana-community/loki -n loki --create-namespace -f observability/loki-values.yaml
+helm install fluent-bit fluent/fluent-bit -n loki -f observability/fluent-bit-values.yaml
+kubectl apply -f observability/loki-datasource.yaml
+kubectl apply -f observability/tracing.yaml
+kubectl apply -f observability/slo-rules.yaml
+kubectl create secret generic discord-webhook -n monitoring --from-literal=url='<your webhook URL>'
+kubectl apply -f observability/alertmanager-discord.yaml
 ```
 
-Fire up Stan's Robot Shop with:
+## Known issues and notes
 
-```shell
-$ docker-compose up
-```
-
-If you want to fire up some load as well:
-
-```shell
-$ docker-compose -f docker-compose.yaml -f docker-compose-load.yaml up
-```
-
-If you are running it locally on a Linux host you can also run the Instana [agent](https://docs.instana.io/quick_start/agent_setup/container/docker/) locally, unfortunately the agent is currently not supported on Mac.
-
-There is also only limited support on ARM architectures at the moment.
-
-## Marathon / DCOS
-
-The manifests for robotshop are in the *DCOS/* directory. These manifests were built using a fresh install of DCOS 1.11.0. They should work on a vanilla HA or single instance install.
-
-You may install Instana via the DCOS package manager, instructions are here: https://github.com/dcos/examples/tree/master/instana-agent/1.9
-
-## Kubernetes
-You can run Kubernetes locally using [minikube](https://github.com/kubernetes/minikube) or on one of the many cloud providers.
-
-The Docker container images are all available on [Docker Hub](https://hub.docker.com/u/robotshop/).
-
-Install Stan's Robot Shop to your Kubernetes cluster using the [Helm](K8s/helm/README.md) chart.
-
-To deploy the Instana agent to Kubernetes, just use the [helm](https://github.com/instana/helm-charts) chart.
-
-## Accessing the Store
-If you are running the store locally via *docker-compose up* then, the store front is available on localhost port 8080 [http://localhost:8080](http://localhost:8080/)
-
-If you are running the store on Kubernetes via minikube then, find the IP address of Minikube and the Node Port of the web service.
-
-```shell
-$ minikube ip
-$ kubectl get svc web
-```
-
-If you are using a cloud Kubernetes / Openshift / Mesosphere then it will be available on the load balancer of that system.
-
-## Load Generation
-A separate load generation utility is provided in the `load-gen` directory. This is not automatically run when the application is started. The load generator is built with Python and [Locust](https://locust.io). The `build.sh` script builds the Docker image, optionally taking *push* as the first argument to also push the image to the registry. The registry and tag settings are loaded from the `.env` file in the parent directory. The script `load-gen.sh` runs the image, it takes a number of command line arguments. You could run the container inside an orchestration system (K8s) as well if you want to, an example descriptor is provided in K8s directory. For End-user Monitoring ,load is not automatically generated but by navigating through the Robotshop from the browser .For more details see the [README](load-gen/README.md) in the load-gen directory.  
-
-## Website Monitoring / End-User Monitoring
-
-### Docker Compose
-
-To enable Website Monioring / End-User Monitoring (EUM) see the official [documentation](https://docs.instana.io/website_monitoring/) for how to create a configuration. There is no need to inject the JavaScript fragment into the page, this will be handled automatically. Just make a note of the unique key and set the environment variable `INSTANA_EUM_KEY` and `INSTANA_EUM_REPORTING_URL` for the web image within `docker-compose.yaml`.
-
-### Kubernetes
-
-The Helm chart for installing Stan's Robot Shop supports setting the key and endpoint url required for website monitoring, see the [README](K8s/helm/README.md).
-
-## Prometheus
-
-The cart and payment services both have Prometheus metric endpoints. These are accessible on `/metrics`. The cart service provides:
-
-* Counter of the number of items added to the cart
-
-The payment services provides:
-
-* Counter of the number of items perchased
-* Histogram of the total number of items in each cart
-* Histogram of the total value of each cart
-
-To test the metrics use:
-
-```shell
-$ curl http://<host>:8080/api/cart/metrics
-$ curl http://<host>:8080/api/payment/metrics
-```
-
+* The kind node inherited a very large open files limit, which made MySQL and RabbitMQ get killed for running out of memory at startup. The fix was to set `LimitNOFILE=1048576` for containerd inside the kind node. This has to be repeated if the cluster is recreated.
+* Robot Shop does not expose general request metrics, so there is no requests per second panel. The SLI uses the Blackbox probe instead.
+* Tracing covers the `shipping` service only.
+* Alerts go to Discord instead of Slack, because no Slack workspace was available.
+* Robot Shop runs Redis as a single replica StatefulSet, which is the weak point exposed by the drill.
