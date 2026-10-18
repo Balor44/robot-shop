@@ -17,20 +17,40 @@ spec:
       {{ if .Values.psp.enabled }}
       serviceAccountName: robot-shop
       {{ end }}
+      initContainers:
+      - name: otel-agent
+        image: curlimages/curl
+        command: ["sh", "-c", "curl -fL -o /otel/opentelemetry-javaagent.jar https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/latest/download/opentelemetry-javaagent.jar"]
+        volumeMounts:
+        - name: otel
+          mountPath: /otel
       containers:
       - name: shipping
         image: {{ .Values.image.repo }}/rs-shipping:{{ .Values.image.version }}
         imagePullPolicy: {{ .Values.image.pullPolicy }}
+        env:
+        - name: JAVA_TOOL_OPTIONS
+          value: "-javaagent:/otel/opentelemetry-javaagent.jar"
+        - name: OTEL_SERVICE_NAME
+          value: shipping
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: http://otel-collector.tracing.svc.cluster.local:4318
+        - name: OTEL_EXPORTER_OTLP_PROTOCOL
+          value: http/protobuf
+        - name: OTEL_METRICS_EXPORTER
+          value: none
+        - name: OTEL_LOGS_EXPORTER
+          value: none
         ports:
         - containerPort: 8080
         # it's Java it needs lots of memory
         resources:
           limits:
-            cpu: 200m
-            memory: 1000Mi
+            cpu: 500m
+            memory: 1500Mi
           requests:
             cpu: 100m
-            memory: 500Mi
+            memory: 600Mi
         readinessProbe:
           httpGet:
             path: /health
@@ -39,6 +59,12 @@ spec:
           periodSeconds: 5
           failureThreshold: 30
           successThreshold: 1
+        volumeMounts:
+        - name: otel
+          mountPath: /otel
+      volumes:
+      - name: otel
+        emptyDir: {}
       restartPolicy: Always
       {{- with .Values.shipping.affinity }}
       affinity:
