@@ -1,0 +1,23 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: robot-shop-slo
+  namespace: monitoring
+  labels:
+    release: monitoring
+spec:
+  groups:
+  - name: robot-shop-slo
+    rules:
+    - record: robotshop:availability:ratio_5m
+      expr: avg_over_time(probe_success{instance="http://web.robot-shop.svc:8080/"}[5m])
+    - record: robotshop:availability:ratio_30d
+      expr: avg_over_time(probe_success{instance="http://web.robot-shop.svc:8080/"}[30d])
+    - alert: RobotShopErrorBudgetBurn
+      expr: (1 - robotshop:availability:ratio_5m) > (14.4 * 0.01)
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Robot Shop is burning its error budget too fast"
+        description: "The error rate over the last 5 minutes is far above the 1% budget behind our 99% availability SLO."
